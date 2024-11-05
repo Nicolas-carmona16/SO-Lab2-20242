@@ -1,0 +1,7 @@
+pwd
+ls
+cd ..
+ls
+pwd
+echo "Hola esta es una prueba"
+exit

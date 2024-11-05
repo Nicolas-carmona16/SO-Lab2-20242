@@ -5,288 +5,294 @@
 * *******************************************/
 
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 
-#define MAX_ARGS 64
-#define MAX_PATHS 64
+#define DELIM " \t\r\n\a"  // Separadores de tokens en la entrada
 
-char error_message[30] = "An error has occurred\n";
-char *paths[MAX_PATHS];  // Almacena los directorios para buscar ejecutables
+// Declaración de funciones
+int execute(char* args[], char* retArgs[]);
+int readCommand(char* args[], FILE* fp);
+int command_cd(char* args[], int numArgs);
+int command_path(char* args[], int numArgs);
+int lineSeperate(char* line, char* args[], char* delim);
+int redirect(char* ret, char* line);
+int parallel(char* ret, char* line);
+void error_handler();
 
-// Imprime el mensaje de error
-void print_error() {
+// Variable global para almacenar las rutas de búsqueda de comandos
+char* PATH[20];
+
+// Maneja errores imprimiendo un mensaje en STDERR
+void error_handler() {
+    char error_message[30] = "An error has occurred\n";
     write(STDERR_FILENO, error_message, strlen(error_message));
 }
 
-// Inicializa el path con /bin como valor predeterminado
-void initialize_paths() {
-    paths[0] = strdup("/bin");
-    paths[1] = NULL;
-}
-
-// Función para manejar el comando "cd"
-int cd_command(char **args) {
-    if (args[1] == NULL || args[2] != NULL) {  // cd solo debe tener un argumento
-        print_error();
-    } else {
-        if (chdir(args[1]) != 0) {
-            print_error();
-        }
-    }
-    return 1;
-}
-
-// Función para manejar el comando "exit"
-int exit_command(char **args) {
-    if (args[1] != NULL) {  // Error si exit tiene argumentos
-        print_error();
+// Implementación del comando 'cd', cambia el directorio de trabajo
+int command_cd(char* args[], int numArgs) {
+    if (numArgs != 2) {  // El comando 'cd' debe tener un argumento (el directorio)
+        error_handler();
         return 1;
     }
-    exit(0);
+    if (chdir(args[1]) == -1) {  // Cambiar directorio
+        error_handler();
+        return 1;
+    }
+    return 0;
 }
 
-// Función para manejar el comando "path"
-int path_command(char **args) {
-    // Libera la memoria de los paths actuales antes de sobrescribir
-    for (int i = 0; paths[i] != NULL; i++) {
-        free(paths[i]);
-        paths[i] = NULL;
-    }
-    // Almacena los nuevos paths
-    for (int i = 1; args[i] != NULL && i < MAX_PATHS; i++) {
-        paths[i - 1] = strdup(args[i]);
-    }
-    return 1;
-}
-
-// Verifica si el comando es uno de los built-in (cd, exit, path)
-int built_in_commands(char **args) {
-    if (args[0] == NULL) return 0;
-    
-    if (strcmp(args[0], "cd") == 0) {
-        return cd_command(args);
-    } else if (strcmp(args[0], "exit") == 0) {
-        return exit_command(args);
-    } else if (strcmp(args[0], "path") == 0) {
-        return path_command(args);
-    }
-    return 0;  // No es un comando integrado
-}
-
-// Busca el ejecutable en los directorios del path
-char *find_executable(char *command) {
-    if (paths[0] == NULL) {
-        return NULL;  // No se encontró ningún path para buscar
-    }
-
-    for (int i = 0; paths[i] != NULL; i++) {
-        char full_path[1024];
-        snprintf(full_path, sizeof(full_path), "%s/%s", paths[i], command);
-        if (access(full_path, X_OK) == 0) {
-            return strdup(full_path);  // Retorna la ruta del ejecutable
-        }
-    }
-    return NULL;  // No se encontró el ejecutable
-}
-
-// Ejecuta un comando externo
-void execute_command(char **args, char *output_file) {
-    if (args[0] == NULL) {
-        print_error();
-        return;
-    }
-
-    if (paths[0] == NULL) {
-        print_error();
-        return;
-    }
-
-    pid_t pid = fork();
-    
-    if (pid == 0) {  // Proceso hijo
-        if (output_file) {
-            int fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) {
-                print_error();
-                exit(1);
-            }
-            dup2(fd, STDOUT_FILENO);  // Redirige stdout
-            dup2(fd, STDERR_FILENO);  // Redirige stderr
-            close(fd);
-        }
-
-        // Soporte para rutas absolutas o relativas
-        if (args[0][0] == '/' || args[0][0] == '.') {
-            if (access(args[0], X_OK) == 0) {
-                execv(args[0], args);
-                print_error();  // Si execv falla
-                exit(1);
-            } else {
-                print_error();
-                exit(1);
-            }
-        } else {
-            // Busca en los directorios del path
-            char *executable = find_executable(args[0]);
-            if (executable != NULL) {
-                execv(executable, args);
-                free(executable);
-                print_error();  // Si execv falla
-                exit(1);
-            } else {
-                print_error();
-                exit(1);
-            }
-        }
-    } else if (pid < 0) {
-        print_error();  // Error en fork
-    } else {
-        wait(NULL);  // Espera a que el proceso hijo termine
-    }
-}
-
-// Procesa y ejecuta un solo comando
-void process_command(char *line) {
-    char *args[MAX_ARGS];
-    char *output_file = NULL;
+// Implementación del comando 'path', establece nuevas rutas para buscar comandos
+int command_path(char* args[], int numArgs) {
     int i = 0;
-    int redirection_count = 0;
-
-    // Verifica si la línea empieza con '>'
-    if (line[0] == '>') {
-        print_error();
-        return;
-    }
-
-    // Divide la línea en tokens
-    char *token = strtok(line, " \t\n");
-    while (token != NULL && i < MAX_ARGS - 1) {
-        if (strcmp(token, ">") == 0) {
-            redirection_count++;
-            if (redirection_count > 1) {  // Múltiples redirecciones
-                print_error();
-                return;
-            }
-            token = strtok(NULL, " \t\n");
-            if (token == NULL || strchr(token, '>')) {  // No hay archivo o múltiples >
-                print_error();
-                return;
-            }
-            output_file = token;  // Almacena el archivo de salida
-        } else {
-            args[i] = token;  // Almacena el argumento
-            i++;
-        }
-        token = strtok(NULL, " \t\n");
-    }
-
-    if (token != NULL) {  // Demasiados argumentos
-        print_error();
-        return;
-    }
-    
-    args[i] = NULL;  // Termina la lista de argumentos
-
-    if (args[0] == NULL) return;  // Comando vacío
-
-    if (built_in_commands(args)) {
-        if (output_file != NULL) {  // Redirección con comando built-in
-            print_error();
-        }
-        return;  // Si es un comando integrado, ya fue procesado
-    }
-
-    execute_command(args, output_file);  // Ejecuta el comando externo
-}
-
-// Procesa múltiples comandos en paralelo
-void process_parallel_commands(char *line) {
-    char *commands[MAX_ARGS];
-    int i = 0;
-
-    // Divide la línea en comandos separados por &
-    char *token = strtok(line, "&");
-    while (token != NULL && i < MAX_ARGS - 1) {
-        commands[i] = token;  // Almacena el comando
+    // Copiar las rutas especificadas en 'args' a la variable global PATH
+    while (1) {
+        if ((PATH[i] = args[i + 1]) == NULL)
+            break;
         i++;
-        token = strtok(NULL, "&");
     }
-    
-    if (token != NULL) {  // Demasiados comandos paralelos
-        print_error();
-        return;
-    }
-    
-    commands[i] = NULL;
-
-    pid_t pids[MAX_ARGS];
-    int j = 0;
-
-    // Ejecuta cada comando en un proceso separado
-    for (j = 0; commands[j] != NULL; j++) {
-        if ((pids[j] = fork()) == 0) {
-            process_command(commands[j]);  // Procesa el comando
-            exit(0);
-        } else if (pids[j] < 0) {
-            print_error();  // Error en fork
-            return;
-        }
-    }
-
-    // Espera a que todos los procesos paralelos terminen
-    for (int k = 0; k < j; k++) {
-        waitpid(pids[k], NULL, 0);
-    }
+    return 0;
 }
 
-// Función principal del shell
-int main(int argc, char *argv[]) {
-    char *line = NULL;
+// Separa una línea de texto en argumentos usando delimitadores
+int lineSeperate(char* line, char* args[], char* delim) {
+    char *save;
+    int argsIndex = 0;
+    args[argsIndex] = strtok_r(line, delim, &save);
+    argsIndex++;
+    // Continuar separando los argumentos
+    while (1) {
+        args[argsIndex] = strtok_r(NULL, delim, &save);
+        if (args[argsIndex] == NULL)
+            break;
+        argsIndex++;
+    }
+    if (args[0] == NULL)
+        return 0;
+    return argsIndex;
+}
+
+// Maneja la redirección de salida '>'
+int redirect(char* ret, char* line) {
+    char* progArgs[100];
+    char* retArgs[100];
+    ret[0] = '\0';  // Limpiar el buffer de redirección
+    ret = ret + 1;  // Saltar el '>' en el string
+    int argsNum = lineSeperate(line, progArgs, DELIM);  // Separar el comando y sus argumentos
+    if (argsNum == 0) {
+        error_handler();
+        return 1;
+    }
+    int retArgc = lineSeperate(ret, retArgs, DELIM);  // Separar el archivo de salida
+    if (retArgc != 1) {  // Solo se permite un archivo de salida
+        error_handler();
+        return 1;
+    }
+    execute(progArgs, retArgs);  // Ejecutar el comando con redirección
+    return 0;
+}
+
+// Maneja la ejecución de comandos en paralelo usando '&'
+int parallel(char* ret, char* line) {
+    char** commands = malloc(100 * sizeof(char*));
+    int numCommands = lineSeperate(line, commands, "&");  // Separar los comandos por '&'
+    char** args = malloc(50 * sizeof(char*));
+    char* retRedir = malloc(100 * sizeof(char));
+    for (int i = 0; i < numCommands; i++) {
+        // Si se detecta una redirección, manejarla
+        if ((retRedir = strchr(commands[i], '>'))) {
+            redirect(retRedir, commands[i]);
+            continue;
+        }
+        // Ejecutar cada comando en paralelo
+        lineSeperate(commands[i], args, DELIM);
+        execute(args, NULL);
+    }
+    free(args);
+    free(commands);
+    return 0;
+}
+
+// Lee una línea de comandos desde la entrada estándar o desde un archivo
+int readCommand(char* args[], FILE* fp) {
+    char* line = malloc(100 * sizeof(char));
     size_t len = 0;
+    ssize_t nread;
+    char* retRedir = NULL;
+    char* retParal = NULL;
 
-    // Verifica si es modo batch o interactivo
-    FILE *input_stream = stdin;
+    fflush(stdin);
+    if ((nread = getline(&line, &len, fp)) == -1) {  // Leer la línea de entrada
+        return 1;
+    }
+    if ((strcmp(line, "\n") == 0) || (strcmp(line, "") == 0))  // Línea vacía
+        return -1;
 
-    if (argc > 2) {
-        print_error();
+    if (line[strlen(line) - 1] == '\n')  // Eliminar salto de línea al final
+        line[strlen(line) - 1] = '\0';
+
+    if (line[0] == EOF) {  // Fin de archivo
+        return 1;
+    }
+
+    // Verificar si hay comandos paralelos '&' o redirección '>'
+    if ((retParal = strchr(line, '&'))) {
+        parallel(retParal, line);
+        return -1;
+    }
+
+    if ((retRedir = strchr(line, '>'))) {
+        redirect(retRedir, line);
+        return -1;
+    }
+
+    // Separar la línea en argumentos
+    int argsIndex = lineSeperate(line, args, DELIM);
+    if (argsIndex == 0) {
+        return 0;
+    }
+
+    // Comandos internos 'exit', 'cd', 'path'
+    if (strcmp(args[0], "exit") == 0) {
+        if (args[1])  // No debe tener argumentos
+            error_handler();
+        exit(0);
+    }
+    if (strcmp(args[0], "cd") == 0) {
+        command_cd(args, argsIndex);
+        return -1;
+    }
+    if (strcmp(args[0], "path") == 0) {
+        command_path(args, argsIndex);
+        return -1;
+    }
+    return 0;
+}
+
+// Ejecuta un comando con sus argumentos, buscando el ejecutable en las rutas definidas
+int execute(char* args[], char* retArgs[]) {
+    int pid;
+    int status;
+    char* commandPath = malloc(100 * sizeof(char*));
+    int i = 0;  // Índice para iterar sobre las rutas de PATH
+    int isNotFound = 1;
+
+    if (PATH[0] == NULL) {  // Si no se ha definido ninguna ruta
+        error_handler();
+        return 1;
+    }
+    if (args == NULL || args[0] == NULL)  // Argumentos nulos
+        return 1;
+
+    // Buscar el ejecutable en las rutas definidas
+    while (1) {
+        if (PATH[i] == NULL)
+            break;
+
+        char* tempStr = malloc(100 * sizeof(char));
+        if (!strcpy(tempStr, PATH[i])) {  // Copiar la ruta
+            error_handler();
+            return 1;
+        }
+        int strLen = strlen(tempStr);
+        tempStr[strLen] = '/';
+        tempStr[strLen + 1] = '\0';
+        strcat(tempStr, args[0]);
+
+        if (access(tempStr, X_OK) == 0) {  // Verificar si el archivo es ejecutable
+            strcpy(commandPath, tempStr);
+            isNotFound = 0;
+            free(tempStr);
+            break;
+        }
+        free(tempStr);
+        i++;
+    }
+    
+    if (isNotFound) {  // No se encontró el comando
+        error_handler();
+        return 1;
+    }
+
+    // Crear un proceso hijo para ejecutar el comando
+    pid = fork();
+    switch (pid) {
+        case -1:
+            error_handler();
+            return 1;
+        case 0:  // Proceso hijo
+            if (retArgs) {
+                int fd_out = open(retArgs[0], O_CREAT | O_WRONLY | O_TRUNC, S_IRWXU);
+                if (fd_out > 0) {  // Redirigir salida estándar al archivo
+                    dup2(fd_out, STDOUT_FILENO);
+                    fflush(stdout);
+                }
+            }
+            execv(commandPath, args);  // Ejecutar el comando
+            exit(1);  // Si execv falla, salir
+        default:
+            waitpid(pid, &status, 0);  // Esperar que termine el hijo
+    }
+    free(commandPath);
+    return 0;
+}
+
+// Función principal
+int main(int argc, char* argv[]) {
+    int isBatchMode = 0;
+    PATH[0] = "/bin";  // Definir el directorio de búsqueda de comandos por defecto
+
+    FILE* fp;
+    char** args;
+    if (argc == 2) {  // Modo batch (ejecución desde archivo)
+        if (!(fp = fopen(argv[1], "r"))) {  // Abrir el archivo de comandos
+            error_handler();
+            exit(1);
+        }
+        isBatchMode = 1;
+    } else if (argc < 1 || argc > 2) {  // Número incorrecto de argumentos
+        error_handler();
         exit(1);
     }
 
-    if (argc == 2) {
-        input_stream = fopen(argv[1], "r");
-        if (!input_stream) {
-            print_error();
-            exit(1);
-        }
-    }
-
-    initialize_paths();  // Inicializa las rutas de búsqueda
-
+    int isFinish = 0;
     while (1) {
-        if (input_stream == stdin) {
-            printf("wish> ");
-            fflush(stdout);  // Asegura que el prompt se muestre
-        }
-
-        if (getline(&line, &len, input_stream) == -1) {
-            if (input_stream != stdin) {
-                fclose(input_stream);  // Cierra el archivo batch
+        if (isBatchMode == 1) {  // Modo batch
+            while (1) {
+                args = malloc(100 * sizeof(char));
+                int readStatus = readCommand(args, fp);  // Leer el comando del archivo
+                fflush(fp);
+                if (readStatus == -1)
+                    continue;  // Si es un comando interno, continuar
+                if (readStatus == 1) {
+                    isFinish = 1;
+                    break;
+                }
+                int errNum = execute(args, NULL);  // Ejecutar el comando
+                free(args);
+                if (errNum == 1)
+                    continue;
             }
-            free(line);  // Libera la memoria antes de salir
-            exit(0);  // EOF encontrado
+            break;
+        } else {  // Modo interactivo
+            fprintf(stdout, "wish> ");  // Imprimir el prompt
+            fflush(stdout);
+            args = malloc(100 * sizeof(char));
+            int readStatus = readCommand(args, stdin);  // Leer comando de la entrada estándar
+            fflush(stdin);
+            if (readStatus == -1)
+                continue;   // Si es un comando interno, continuar
+            if (readStatus == 1)
+                break;
+            if (execute(args, NULL) == 1)
+                continue;   // Si hay un error, continuar
+            free(args);
         }
-
-        // Si hay & en la línea, es un comando paralelo
-        if (strchr(line, '&')) {
-            process_parallel_commands(line);
-        } else {
-            process_command(line);  // Procesa un comando normal
-        }
+        if (isFinish)
+            break;
     }
-
     return 0;
 }
